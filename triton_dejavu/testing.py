@@ -194,6 +194,7 @@ class KernelEvalCall:
         self.compiled_kernel = None
         self.cur_config = cur_config
         self._jit_was_triggered = False
+        self.compile_time = 0
 
     def __call__(self):
         # pre_hook, post_hook must be part of call_lambda (see autotuner.py)
@@ -209,9 +210,11 @@ class KernelEvalCall:
                     print(
                         f"[triton-dejavu] First execution including JIT compilation took {compile_time}s."
                     )
-                return ret
-
-            return jit_first_time()
+                return ret, compile_time
+            
+            result, compile_time = jit_first_time()
+            self.compile_time = compile_time
+            return result
         else:
             return self.call_lambda()
 

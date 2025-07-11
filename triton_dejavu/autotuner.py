@@ -211,6 +211,7 @@ class Autotuner(KernelInterface):
         while not inspect.isfunction(self.base_fn):
             self.base_fn = self.base_fn.fn
         self._timings = {}
+        self.all_timings = {}
         if triton_major_version >= 3:
             self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
             self.benchmarking_stream = (
@@ -283,7 +284,7 @@ class Autotuner(KernelInterface):
                 self.key_hash,
                 self._param_hash,
             )
-        self.cache = global_dejavu_storage.restore_autotuner_cache(
+        self.cache, self.partial_configs = global_dejavu_storage.restore_autotuner_cache(
             fn,
             self.configs_hash,
             self.key_hash,
@@ -442,7 +443,7 @@ class Autotuner(KernelInterface):
                 run_id=self.run_id,
                 path_prefix=str(self._obj_hash),
             )
-            return bench_res
+            return bench_res, kernel_call_obj.compile_time
         except (
             OutOfResources,
             CompileTimeAssertionFailure,
@@ -470,7 +471,8 @@ class Autotuner(KernelInterface):
                 else [float("inf"), float("inf"), float("inf")]
             )
 
-    def _run_benchmarks(self, *args, configs, **kwargs):
+    def _run_benchmarks(self, *args, configs, key, **kwargs):
+        self.all_timings.setdefault(key, [])
         if self._use_split_cache:
             self._update_triton_cache_path()
         if flag_print_debug:
@@ -478,10 +480,32 @@ class Autotuner(KernelInterface):
                 f"[triton-dejavu] [{time.strftime('%Y-%m-%d %H:%M:%S')}]  Started benchmarking of {len(configs)} configurations... (use_bo: {self.use_bo}, run: {self.run_id})"
             )
         if not self.use_bo and not self.use_random_search:
-            timings = {
-                config: self._bench(*args, config=config, **kwargs)
-                for config in configs
-            }
+            timings = {}
+
+            computed_configs = []
+            if key in self.partial_configs:
+                for val in self.partial_configs[key]:
+                    self.all_timings[key].append(val) 
+                    computed_configs.append(val['config'])
+
+            computed_configs = [_all_kwargs(v) for v in computed_configs]
+            filtered_list = [item for item in configs if _all_kwargs(item) not in computed_configs]
+            for config in filtered_list:
+                result, compile_time = self._bench(*args, config=config, **kwargs)
+                self.all_timings[key].append({"config": config, "runtime": result, 'compile_time': compile_time}) 
+                global_dejavu_storage.store_all_config_results(self.cache, self.all_timings, key, self.fn,
+                    self.configs_hash,
+                    self.key_hash,
+                    self._param_hash,
+                    self.configs_len,
+                    self.bench_time,
+                    self.use_cuda_graph,
+                    self.orig_keys)
+                timings[config] = result
+            # timings = {
+            #     config: self._bench(*args, config=config, **kwargs)
+            #     for config in configs
+            # }
             best_config = builtins.min(timings, key=timings.get)
 
         elif self.use_bo:
@@ -520,7 +544,7 @@ class Autotuner(KernelInterface):
                 # Necessary to avoid persistent RuntimeErrors
                 # args_copy = [a.clone() if isinstance(a, torch.Tensor) else a for a in args]
                 # bench_timings = self._bench(*args_copy, config=triton_config, **kwargs)
-                bench_timings = self._bench(*args, config=triton_config, **kwargs)
+                bench_timings, compile_time = self._bench(*args, config=triton_config, **kwargs)
                 print(f"_bench returned {bench_timings}")
                 # if self.use_cuda_graph:
                 if self.quantiles is None:
@@ -642,7 +666,7 @@ class Autotuner(KernelInterface):
                 for ci in random_search_list:
                     this_config = self.configs[ci]
                     print(f"\ntesting {this_config}")
-                    bench_timings = self._bench(*args, config=this_config, **kwargs)
+                    bench_timings, compile_time = self._bench(*args, config=this_config, **kwargs)
                     print(f"_bench returned {bench_timings}")
                     timings[this_config] = bench_timings
                     if self.quantiles is None:
@@ -730,7 +754,7 @@ class Autotuner(KernelInterface):
                         pruned_configs = self.prune_configs(kwargs)
                         bench_start = time.time()
                         timings, best_config = self._run_benchmarks(
-                            *args, configs=pruned_configs, **kwargs
+                            *args, configs=pruned_configs, key=key, **kwargs
                         )
                         bench_end = time.time()
                         self.bench_time = bench_end - bench_start
@@ -756,6 +780,7 @@ class Autotuner(KernelInterface):
                                 f"All autotune examples failed (timing is {self._timings[key]})."
                             )
                         self.configs_timings = timings
+
                         self.pre_hook(args, reset_only=True)
                     else:
                         self.cache[key] = self._fallback_call(key_orig)
